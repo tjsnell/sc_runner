@@ -8,7 +8,7 @@ maps columns, validates the data, and provides export options.
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import openpyxl
 from io import BytesIO
 
@@ -18,6 +18,13 @@ from domain_model import (
     TableSchema, MappingService, RecordTransformationService,
     SourceColumnName, AccountIdentifier
 )
+
+# Snowflake connector (optional, for database insert)
+try:
+    import snowflake.connector
+    SNOWFLAKE_AVAILABLE = True
+except ImportError:
+    SNOWFLAKE_AVAILABLE = False
 
 
 # ============================================================================
@@ -182,6 +189,65 @@ def to_excel(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+@st.cache_resource
+def get_snowflake_connection():
+    """
+    Establish Snowflake connection with SSO browser authentication.
+    Connection is cached for the session.
+    """
+    if not SNOWFLAKE_AVAILABLE:
+        raise ImportError("snowflake-connector-python is not installed")
+
+    # Get connection parameters from secrets
+    if "snowflake" not in st.secrets:
+        raise ValueError("Snowflake configuration not found in secrets.toml")
+
+    config = st.secrets["snowflake"]
+
+    try:
+        conn = snowflake.connector.connect(
+            account=config["account"],
+            user=config["user"],
+            authenticator=config.get("authenticator", "externalbrowser"),
+            role=config.get("role"),
+            warehouse=config.get("warehouse"),
+            database=config.get("database"),
+            schema=config.get("schema")
+        )
+        return conn
+    except Exception as e:
+        st.error(f"Failed to connect to Snowflake: {e}")
+        raise
+
+
+def insert_to_snowflake(df: pd.DataFrame, conn, table_name: str) -> int:
+    """Insert DataFrame into Snowflake table"""
+    cursor = conn.cursor()
+
+    try:
+        # Prepare insert statement
+        columns = df.columns.tolist()
+        placeholders = ", ".join(["%s"] * len(columns))
+        column_names = ", ".join(columns)
+
+        insert_sql = f"""
+            INSERT INTO {table_name} ({column_names})
+            VALUES ({placeholders})
+        """
+
+        # Convert DataFrame to list of tuples
+        data = [tuple(row) for row in df.values]
+
+        # Execute batch insert
+        cursor.executemany(insert_sql, data)
+        conn.commit()
+
+        return len(data)
+
+    finally:
+        cursor.close()
+
+
 # ============================================================================
 # PRESENTATION LAYER - Streamlit UI
 # ============================================================================
@@ -224,7 +290,7 @@ def main():
 
             col1, col2 = st.columns(2)
             with col1:
-                st.metric("Effective Date", source.effective_date)
+                st.metric("Effective Date", str(source.effective_date))
                 st.metric("Total Records", len(source.data_rows))
             with col2:
                 st.info(f"**Title:** {source.title_row}")
@@ -353,6 +419,45 @@ def main():
                                 unique_timeframes = processed_df['TIME_FRAME'].nunique()
                                 st.metric("Unique Timeframes", unique_timeframes)
 
+                        # Snowflake Insert Section (if available)
+                        if SNOWFLAKE_AVAILABLE and "snowflake" in st.secrets:
+                            st.subheader("💾 Insert to Snowflake")
+
+                            st.warning("⚠️ This will insert data into the Snowflake table. Ensure data is validated before proceeding.")
+
+                            col1, col2 = st.columns([1, 3])
+                            with col1:
+                                insert_button = st.button(
+                                    "💾 Insert to Snowflake",
+                                    type="secondary"
+                                )
+
+                            if insert_button:
+                                with st.spinner("Connecting to Snowflake with SSO (browser will open)..."):
+                                    try:
+                                        # Get connection (will trigger browser SSO)
+                                        conn = get_snowflake_connection()
+
+                                        st.info("✅ Connected to Snowflake")
+
+                                        # Get table name from config
+                                        config = st.secrets["snowflake"]
+                                        full_table_name = f"{config['database']}.{config['schema']}.{config.get('table', 'BI5305_SC_ALLOC_LIST')}"
+
+                                        with st.spinner(f"Inserting {len(processed_df)} records into {full_table_name}..."):
+                                            rows_inserted = insert_to_snowflake(processed_df, conn, full_table_name)
+
+                                            st.success(f"""
+                                            ✅ Successfully inserted {rows_inserted} records into Snowflake!
+
+                                            **Table:** {full_table_name}
+                                            **Effective Date:** {source.effective_date}
+                                            """)
+
+                                    except Exception as e:
+                                        st.error(f"❌ Error inserting to Snowflake: {e}")
+                                        st.exception(e)
+
                     except Exception as e:
                         st.error(f"❌ Error processing data: {e}")
                         st.exception(e)
@@ -401,6 +506,24 @@ def main():
         st.header("🔧 Configuration")
         schema = TableSchema()
         st.code(f"Table: {schema.table_name}")
+
+        # Snowflake status
+        st.header("❄️ Snowflake")
+        if SNOWFLAKE_AVAILABLE:
+            if "snowflake" in st.secrets:
+                config = st.secrets["snowflake"]
+                st.success("✅ Configured")
+                st.code(f"""Account: {config.get('account', 'N/A')}
+Database: {config.get('database', 'N/A')}
+Schema: {config.get('schema', 'N/A')}
+Table: {config.get('table', 'BI5305_SC_ALLOC_LIST')}
+Auth: {config.get('authenticator', 'externalbrowser')}""")
+            else:
+                st.warning("⚠️ Not configured")
+                st.caption("Add Snowflake credentials to `.streamlit/secrets.toml` to enable database insert")
+        else:
+            st.error("❌ Not installed")
+            st.caption("Install: `pip install snowflake-connector-python`")
 
 
 if __name__ == "__main__":
